@@ -1,0 +1,289 @@
+{\rtf1\ansi\ansicpg1252\cocoartf2822
+\cocoatextscaling0\cocoaplatform0{\fonttbl\f0\fswiss\fcharset0 Helvetica;}
+{\colortbl;\red255\green255\blue255;}
+{\*\expandedcolortbl;;}
+\paperw11900\paperh16840\margl1440\margr1440\vieww11520\viewh8400\viewkind0
+\pard\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\pardirnatural\partightenfactor0
+
+\f0\fs24 \cf0 s================================================================================\
+STRATEGY DESCRIPTION \'96 RUSSELL 3000 BAB IMPLEMENTATION\
+================================================================================\
+\
+High-level design\
+-----------------\
+This project builds a long\'96short Betting-Against-Beta (BAB) factor on a \
+Russell-3000-like U.S. stock universe with monthly rebalancing:\
+\
+1. Universe:\
+   - Starting universe is TODAY\'92S Russell 3000 proxy:\
+     * Primary source: iShares IWV holdings CSV (official Russell 3000 ETF).\
+     * Fallback: S&P 500 constituents (Wikipedia) plus an extended curated list\
+       of large, mid and small cap U.S. stocks across sectors.\
+   - Universe is treated as FIXED over time (survivorship bias by design).\
+   - Only regular common stocks are used (no ETFs, no ADRs, no prefs, no\
+     warrants, no cash positions).\
+\
+2. Sample period and frequency:\
+   - Price data: daily adjusted close from Yahoo Finance (`yfinance`),\
+     resampled to month-end.\
+   - START_DATE = 2000-01-01, END_DATE = today (configurable).\
+   - Portfolio formation and rebalancing: monthly, at month-end.\
+\
+3. Benchmark and risk-free rate:\
+   - Market proxy for beta estimation: IWV (Russell 3000 ETF, total market).\
+   - Risk-free rate proxy: ^IRX (3-month T-Bill), downloaded daily and\
+     resampled to month-end:\
+       * Quoted as annualized percentage \uc0\u8594  converted to monthly decimal.\
+       * If ^IRX is unavailable, a fallback is attempted (^TNX) or RF=0.\
+\
+4. Returns and excess returns:\
+   - Stock and IWV returns: simple monthly returns from adjusted prices\
+     (includes dividends and splits as handled by Yahoo).\
+   - Excess returns: R_i,t - R_f,t using the monthly RF series.\
+\
+5. Beta estimation (core for BAB):\
+   - Rolling window: 60 months (5 Jahre) as in Frazzini\'96Pedersen.\
+   - Minimum observations per stock: 36 months required for a valid beta.\
+   - Beta formula:\
+       \uc0\u946 _i,t = Cov(R_i,t - R_f,t , R_m,t - R_f,t) / Var(R_m,t - R_f,t)\
+   - Betas are computed at month-end t and used to form portfolios for t+1\
+     (implemented via lagging in portfolio_construction.py).\
+   - No Bayesian/shrinkage adjustment, no explicit microstructure filters.\
+   - Betas are winsorized to [\uc0\u8722 2.0, 5.0] to avoid extreme leverage artefacts.\
+\
+6. Portfolio construction (downstream, but implied by this loader):\
+   - Stocks are sorted each month into 5 beta quintiles (Q1 = low beta,\
+     Q5 = high beta).\
+   - Quintiles are equal-weighted across stocks (no value-weighting).\
+   - BAB leg definitions:\
+       * Long leg: Q1 (defensive low-beta stocks).\
+       * Short leg: Q5 (aggressive high-beta stocks).\
+   - Beta scaling:\
+       * Compute \uc0\u946 _L = mean beta of Q1, \u946 _H = mean beta of Q5.\
+       * Scale returns as:\
+             r_L,scaled = (1/\uc0\u946 _L) \'b7 r_L\
+             r_H,scaled = (1/\uc0\u946 _H) \'b7 r_H\
+         so that each leg has ex-ante beta \uc0\u8776  1.\
+       * BAB return:\
+             BAB_t = (1/\uc0\u946 _L) \'b7 r_L,t \u8722  (1/\u946 _H) \'b7 r_H,t\
+       * This aims at a market-neutral factor (\uc0\u946 _BAB \u8776  0), matching\
+         Frazzini\'96Pedersen\'92s scaling logic.\
+\
+7. Factor regressions and diagnostics:\
+   - Fama\'96French 5-Factor data + Momentum (Carhart) are downloaded from\
+     Ken French\'92s data library and converted to monthly decimal returns.\
+   - Factor regressions of BAB are run against:\
+       * CAPM, FF3, Carhart 4F, FF5, FF5+Mom.\
+   - The backtest module computes:\
+       * Annualized return, volatility, Sharpe, Sortino, Calmar.\
+       * Maximum drawdown, skewness, kurtosis.\
+       * Full-sample and rolling betas vs IWV, information ratio, alpha.\
+   - The illustrations module produces equity curves, rolling Sharpe,\
+     rolling betas, drawdowns, quintile stats and factor regression plots.\
+\
+================================================================================\
+KEY SIMPLIFICATIONS (VERSUS FRAZZINI\'96PEDERSEN 2014)\
+================================================================================\
+\
+This implementation is deliberately simplified and **not** a literal \
+institutional replication of the original paper. Major simplifications:\
+\
+1. Survivorship bias in the universe:\
+   - Uses TODAY\'92S IWV constituents applied back to 2000.\
+   - No point-in-time Russell 3000 membership; no delisting file.\
+   - No modelling of firm births/deaths, index inclusions/exclusions.\
+\
+2. Data source and cleaning:\
+   - Sole price source: Yahoo Finance via `yfinance`.\
+   - Corporate actions are only those reflected in adjusted prices.\
+   - No explicit handling of stale quotes, suspensions, trading halts,\
+     or extreme microstructure noise.\
+   - Simple ticker cleaning heuristics (regex + suffix rules) may misclassify\
+     some instruments at the margin.\
+\
+3. Return definition and frequency:\
+   - Monthly simple returns (not log returns).\
+   - Portfolio formation on calendar month-end only; no intra-month events,\
+     no daily/weekly rebalancing, no look-ahead beyond the explicit lagging\
+     of betas.\
+\
+4. Weighting scheme:\
+   - Equal-weighted stocks within each quintile.\
+   - No value-weighted, liquidity-weighted or float-weighted portfolios.\
+   - No minimum size/price/liquidity filters beyond basic data availability.\
+\
+5. Transaction costs and fees:\
+   - **No explicit transaction costs or financing costs** are applied here:\
+     - No bid\'96ask spreads, no commissions, no market impact.\
+     - No margin interest or stock borrowing fee schedule.\
+   - The beta-scaling (leveraging low-beta, de-leveraging high-beta) is\
+     treated as costless.\
+   - Leverage and shorting constraints are assumed frictionless \
+     (unlimited margin, unlimited borrow availability).\
+\
+6. Financing rate vs risk-free rate:\
+   - The same RF proxy (^IRX) is used both:\
+       * For computing excess returns.\
+       * Implicitly as the financing rate for leverage and short positions.\
+   - No differentiation between treasury yield and actual trading margin\
+     costs as in real-world BAB implementations.\
+\
+7. Universe coverage and representativeness:\
+   - \'93Russell 3000\'94 is approximated by IWV holdings + supplements rather \
+     than official CRSP/Compustat point-in-time Russell 3000 constituents.\
+   - Securities missing or mis-mapped in Yahoo are effectively excluded.\
+\
+8. Data availability and start date:\
+   - Effective start date is limited by Yahoo/IWV history and FF factors.\
+   - Early years with sparse data automatically drop stocks that lack a \
+     full 36-month beta history; this reduces cross-sectional coverage at\
+     the beginning of the sample.\
+\
+9. Risk management and execution:\
+   - No explicit constraints on:\
+       * Maximum leverage.\
+       * Sector/industry concentration.\
+       * Single-name weight caps.\
+   - Portfolios are theoretical, not executable orders; slippage and\
+     intraday execution risk are ignored.\
+\
+10. Statistical treatment:\
+    - Beta estimation uses plain rolling cov/var with minimum 36 obs.\
+    - Factor regressions use a simple OLS implementation with HC-style\
+      robust errors; no full Newey\'96West lag structure, no overlapping \
+      returns corrections, no small-sample adjustments.\
+\
+================================================================================\
+KNOWN SOURCES OF BIAS AND POTENTIAL WEAKNESSES\
+================================================================================\
+\
+The resulting BAB series should be read as **didactic and indicative**, not as \
+a precise out-of-sample replication of Frazzini\'96Pedersen. Important caveats:\
+\
+1. Survivorship bias (structural):\
+   - Because only current survivors are in the universe, both low-beta and\
+     high-beta portfolios exclude companies that went bankrupt, were delisted\
+     or acquired under poor terms.\
+   - Low-beta portfolios likely look \'93too good\'94 because boring failures are\
+     missing.\
+   - High-beta portfolios miss some of the worst blow-ups, inflating realised\
+     high-beta performance.\
+   - Net effect on the BAB spread is ambiguous ex ante (can be smaller or \
+     larger), but the *distribution* of outcomes is unquestionably distorted.\
+\
+2. Delisting bias and missing bad tails:\
+   - No explicit delisting returns or final negative jumps; existence of\
+     a return series in Yahoo is effectively a survivorship filter.\
+   - Tail events like Enron/WorldCom/Lehman equivalents are only included\
+     if Yahoo carries a clean historical series.\
+\
+3. Market proxy misspecification:\
+   - IWV is used as the sole market proxy for beta and performance \
+     comparison; in reality, Frazzini\'96Pedersen often use broader or \
+     more detailed aggregates.\
+   - Any tracking error / misalignment between IWV and the actual \
+     economic \'93market portfolio\'94 affects estimated betas and factor \
+     regression loadings.\
+\
+4. Fee and friction underestimation:\
+   - Realistic BAB implementations are leverage- and short-intensive and\
+     highly rotation-heavy (monthly turnover in both legs).\
+   - Ignoring trading costs, borrow fees and margin spreads biases Sharpe\
+     ratios and alphas upwards relative to an implementable product.\
+   - No spread-widening in crises, no funding constraints, no margin calls.\
+\
+5. Funding liquidity and constraints not modelled:\
+   - Core Frazzini\'96Pedersen insights link BAB payoffs to funding liquidity\
+     and margin constraints.\
+   - This implementation does **not**:\
+       * Include any funding liquidity proxy (TED spread, Libor\'96OIS, etc.).\
+       * Model time-varying leverage constraints.\
+       * Condition performance on funding stress regimes.\
+   - As a result, you only see the static low-beta premium, not the \
+     richer funding-liquidity story of the paper.\
+\
+6. Simpler factor backbone:\
+   - FF and momentum factors are taken as published (already cleaned and\
+     pre-constructed) rather than built from the same universe used for BAB.\
+   - This induces a slight mismatch between the test asset universe and \
+     the factor construction universe.\
+\
+7. Implementation risk and coding choices:\
+   - Ticker cleaning is heuristic; some valid stocks may be dropped or\
+     mis-mapped.\
+   - Any outages or data quirks in Yahoo Finance directly affect results.\
+   - Rolling-window alignment and lagging logic are implemented carefully,\
+     but small off-by-one differences vs the paper\'92s exact timing convention\
+     are possible.\
+\
+8. Interpretational limits:\
+   - The BAB factor produced here is best treated as:\
+       * An educational, transparent approximation of a BAB\uc0\u8208 style long\'96short\
+         factor on a broad U.S. universe.\
+       * A tool to study the qualitative shape of the beta\'96return relation,\
+         the effect of beta scaling, and the robustness of alpha to \
+         standard risk factors.\
+   - It is **not**:\
+       * A production-grade, transaction-cost-adjusted hedge fund strategy.\
+       * A literal replication of the proprietary AQR BAB factor.\
+       * A substitute for point-in-time, CRSP/Compustat-level academic work.\
+\
+================================================================================\
+SURVIVORSHIP BIAS DECLARATION\
+================================================================================\
+\
+IMPORTANT: This implementation uses TODAY'S Russell 3000 constituents (via \
+iShares IWV ETF holdings) applied historically back to January 2000. This \
+introduces SURVIVORSHIP BIAS with the following implications:\
+\
+1. OVERESTIMATION OF LOW-BETA PERFORMANCE:\
+   - Stocks that survived to today are disproportionately successful.\
+   - Low-beta "boring" stocks that failed are excluded.\
+   - This biases low-beta portfolio returns upward.\
+\
+2. UNDERREPRESENTATION OF DISTRESSED HIGH-BETA STOCKS:\
+   - Failed high-beta stocks are excluded.\
+   - High-beta portfolios miss their most negative outcomes.\
+   - This biases high-beta portfolio returns upward (less negative than reality).\
+   - Net effect: the BAB spread may differ from the true historical spread.\
+\
+3. UNIVERSE SIZE AND COMPOSITION MISMATCH:\
+   - The Russell 3000 membership in 2000 differs from today.\
+   - We use ~current survivors across the entire period.\
+   - Sector weights (Tech, Financials, Energy, etc.) reflect today\'92s \
+     composition, not the historical composition at each date.\
+\
+MITIGATION AND INTERPRETATION:\
+- The BAB effect has been documented across multiple countries, time periods\
+  and data sets with proper point-in-time universes.\
+- This implementation is therefore best read as:\
+    * A transparent, reproducible toy model of a BAB strategy on a broad \
+      U.S. universe,\
+    * A tool to explore beta sorting, beta scaling and factor regressions,\
+      NOT as definitive evidence on the true magnitude of the BAB premium.\
+\
+================================================================================\
+WHAT THIS SCRIPT DOES\
+================================================================================\
+\
+This script performs the data preparation step for the Russell-3000-style BAB\
+strategy:\
+\
+1. Downloads current Russell 3000 proxy tickers from iShares IWV (or a fallback).\
+2. Cleans ticker symbols and keeps only standard U.S. common stock tickers.\
+3. Downloads daily adjusted close prices for all stocks and IWV, and resamples\
+   them to monthly frequency.\
+4. Downloads the risk-free rate proxy (^IRX) and converts it to monthly\
+   decimal rates.\
+5. Downloads Fama\'96French factors and the momentum factor from Ken French\'92s\
+   data library.\
+6. Computes and stores:\
+   - Monthly prices for all stocks (wide DataFrame).\
+   - Monthly simple returns for all stocks and IWV.\
+   - Monthly excess returns (stock or IWV return minus RF).\
+   - Rolling 60-month betas for all stocks vs IWV (with 36-month minimum).\
+7. Writes a separate survivorship-bias warning file for documentation.\
+\
+Author: BAB Strategy Implementation (Frazzini\'96Pedersen Replication)\
+Date: 2024\
+"""}
