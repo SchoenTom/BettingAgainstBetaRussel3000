@@ -1,581 +1,351 @@
-#!/usr/bin/env python3
 """
-portfolio_construction.py - Betting-Against-Beta (BAB) Portfolio Construction
+portfolio_construction.py - Construct BAB portfolios following F&P (2014) Table 4
 
-Replication of Frazzini and Pedersen (2014) "Betting Against Beta"
-Journal of Financial Economics, 111(1), 1-25.
-
-================================================================================
-BETA SCALING METHODOLOGY (Critical for Proper BAB Construction)
-================================================================================
-
-The key innovation in Frazzini-Pedersen is BETA SCALING, which ensures:
-1. Each portfolio leg has an effective beta of approximately 1.0
-2. The combined BAB portfolio has near-zero market exposure
-3. Returns are comparable across different beta levels
-
-CONSTRUCTION PROCEDURE:
-
-1. RANK STOCKS BY BETA: Sort stocks into quintiles based on estimated beta
-   - Q1 = lowest beta stocks (defensive)
-   - Q5 = highest beta stocks (aggressive)
-
-2. COMPUTE PORTFOLIO BETAS:
-   - β_L = average beta of low-beta portfolio (Q1)
-   - β_H = average beta of high-beta portfolio (Q5)
-
-3. APPLY LEVERAGE/DE-LEVERAGE:
-   - Scale low-beta portfolio: (1/β_L) × r_L  (leverage up)
-   - Scale high-beta portfolio: (1/β_H) × r_H  (de-leverage down)
-
-4. COMPUTE BAB RETURN:
-   BAB_t = (1/β_L) × r_L,t - (1/β_H) × r_H,t
-
-This scaling ensures:
-- Low-beta stocks are levered to beta ≈ 1
-- High-beta stocks are de-levered to beta ≈ 1
-- Net BAB portfolio has beta ≈ 0 (market neutral)
-
-Without scaling, BAB would have negative market exposure (short high-beta
-means net short the market), confounding the true low-beta premium.
-
-================================================================================
-
-Output DataFrame columns:
-- Date: Month-end date
-- BAB_Return: Scaled BAB strategy return
-- BAB_Return_Unscaled: Simple Q1 - Q5 return (for comparison)
-- Q1_Mean_Beta: Average beta of low-beta quintile
-- Q5_Mean_Beta: Average beta of high-beta quintile
-- Q1_Mean_Return: Average return of low-beta quintile
-- Q5_Mean_Return: Average return of high-beta quintile
-- Q1_Scaled_Return: Beta-scaled return of Q1
-- Q5_Scaled_Return: Beta-scaled return of Q5
-- Portfolio_Beta: Ex-ante portfolio beta (should be near 0)
-- N_Q1: Number of stocks in Q1
-- N_Q5: Number of stocks in Q5
-
-Author: BAB Strategy Implementation (Frazzini-Pedersen Replication)
-Date: 2024
+Key methodology from Frazzini & Pedersen (2014):
+1. Decile portfolios: Equal-weighted within each decile
+2. BAB factor: Beta-rank weighted, rescaled to beta=1 per leg
+3. Dollar-neutral: Normalize to $2 gross exposure ($1 per leg)
+4. Uses LAGGED betas (t-1) to avoid look-ahead bias
 """
 
-import os
-import warnings
-
-import numpy as np
 import pandas as pd
+import numpy as np
+import os
+import logging
 
-warnings.filterwarnings('ignore')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-# Configuration
-DATA_DIR = "data"
-OUTPUT_DIR = "output"
-
-# Input file paths (from data_loader.py)
-RETURNS_FILE = os.path.join(DATA_DIR, "monthly_returns.csv")
-EXCESS_RETURNS_FILE = os.path.join(DATA_DIR, "monthly_excess_returns.csv")
-BETAS_FILE = os.path.join(DATA_DIR, "rolling_betas.csv")
-IWV_RETURNS_FILE = os.path.join(DATA_DIR, "iwv_returns.csv")
-IWV_EXCESS_RETURNS_FILE = os.path.join(DATA_DIR, "iwv_excess_returns.csv")
-RF_RATE_FILE = os.path.join(DATA_DIR, "risk_free_rate.csv")
-
-# Output file paths
-BAB_RETURNS_FILE = os.path.join(OUTPUT_DIR, "bab_returns.csv")
-QUINTILE_STATS_FILE = os.path.join(OUTPUT_DIR, "quintile_statistics.csv")
+from config import (
+    DATA_DIR, OUTPUT_DIR, NUM_DECILES, MIN_STOCKS_PER_DECILE, ensure_directories
+)
 
 
-def ensure_output_dir() -> None:
-    """Create output directory if it doesn't exist."""
-    if not os.path.exists(OUTPUT_DIR):
-        os.makedirs(OUTPUT_DIR)
-        print(f"Created output directory: {OUTPUT_DIR}")
+def load_data():
+    """Load required data files."""
+    logger.info("Loading data files...")
+
+    excess_path = os.path.join(DATA_DIR, 'monthly_excess_returns.csv')
+    betas_path = os.path.join(DATA_DIR, 'rolling_betas.csv')
+
+    if not os.path.exists(excess_path) or not os.path.exists(betas_path):
+        raise FileNotFoundError("Run data_loader.py first.")
+
+    excess_returns = pd.read_csv(excess_path, index_col=0, parse_dates=True)
+    betas = pd.read_csv(betas_path, index_col=0, parse_dates=True)
+
+    logger.info(f"Excess returns: {excess_returns.shape}")
+    logger.info(f"Betas: {betas.shape}")
+
+    return excess_returns, betas
 
 
-def load_data() -> tuple:
-    """
-    Load required data from CSV files.
-
-    Returns:
-        Tuple of (returns, excess_returns, betas, IWV returns, IWV excess returns, rf_rate)
-    """
-    print("Loading data files...")
-
-    # Load monthly returns
-    returns = pd.read_csv(RETURNS_FILE, index_col=0, parse_dates=True)
-    print(f"  Returns: {returns.shape[0]} months, {returns.shape[1]} tickers")
-
-    # Load excess returns
-    excess_returns = pd.read_csv(EXCESS_RETURNS_FILE, index_col=0, parse_dates=True)
-    print(f"  Excess Returns: {excess_returns.shape[0]} months, {excess_returns.shape[1]} tickers")
-
-    # Load rolling betas
-    betas = pd.read_csv(BETAS_FILE, index_col=0, parse_dates=True)
-    print(f"  Betas: {betas.shape[0]} months, {betas.shape[1]} tickers")
-
-    # Load IWV returns
-    iwv_returns = pd.read_csv(IWV_RETURNS_FILE, index_col=0, parse_dates=True)
-    print(f"  IWV Returns: {iwv_returns.shape[0]} months")
-
-    # Load IWV excess returns
-    iwv_excess = pd.read_csv(IWV_EXCESS_RETURNS_FILE, index_col=0, parse_dates=True)
-    print(f"  IWV Excess Returns: {iwv_excess.shape[0]} months")
-
-    # Load risk-free rate
-    rf_rate = pd.read_csv(RF_RATE_FILE, index_col=0, parse_dates=True)
-    print(f"  Risk-Free Rate: {rf_rate.shape[0]} months")
-
-    return returns, excess_returns, betas, iwv_returns, iwv_excess, rf_rate
+def get_stock_columns(df):
+    """Get stock columns (exclude benchmark)."""
+    exclude = ['Benchmark', 'MSCI_World', 'RF_Rate']
+    return [col for col in df.columns if col not in exclude]
 
 
-def assign_quintiles(betas_row: pd.Series, n_quantiles: int = 5) -> pd.Series:
-    """
-    Assign stocks to quintiles based on beta values.
+def assign_deciles(betas_series, num_deciles=NUM_DECILES):
+    """Assign stocks to deciles based on beta (1=lowest, 10=highest)."""
+    valid = betas_series.dropna()
 
-    Args:
-        betas_row: Series of beta values for a single month
-        n_quantiles: Number of quantile groups (default 5 for quintiles)
-
-    Returns:
-        Series of quintile assignments (1 = lowest beta, 5 = highest beta)
-    """
-    # Drop NaN values
-    valid_betas = betas_row.dropna()
-
-    if len(valid_betas) < n_quantiles * 2:  # Need at least 2 per quintile
+    if len(valid) < num_deciles * MIN_STOCKS_PER_DECILE:
         return pd.Series(dtype=float)
 
-    # Use qcut to create equal-sized quintiles
     try:
-        quintiles = pd.qcut(valid_betas, q=n_quantiles, labels=False, duplicates='drop') + 1
-        return quintiles
+        deciles = pd.qcut(valid, q=num_deciles, labels=False, duplicates='drop') + 1
+        return deciles
     except ValueError:
-        # Handle case where there aren't enough unique values
         return pd.Series(dtype=float)
 
 
-def construct_bab_portfolio_with_scaling(
-    returns: pd.DataFrame,
-    excess_returns: pd.DataFrame,
-    betas: pd.DataFrame,
-    rf_rate: pd.DataFrame
-) -> pd.DataFrame:
+def compute_beta_rank_weights(betas, is_low_beta_portfolio):
     """
-    Construct BAB portfolio with proper beta scaling following Frazzini-Pedersen (2014).
+    Compute beta-rank weights as per F&P Table 4.
 
-    The scaling procedure ensures market neutrality:
-    - Long portfolio scaled by 1/β_L to achieve beta ≈ 1
-    - Short portfolio scaled by 1/β_H to achieve beta ≈ 1
-    - Combined BAB has beta ≈ 0
-
-    BAB_t = (1/β_L) × r_L,t - (1/β_H) × r_H,t
-
-    This is equivalent to:
-    - Going long $1/β_L in low-beta portfolio
-    - Going short $1/β_H in high-beta portfolio
-    - Net market exposure ≈ 0
-
-    Args:
-        returns: DataFrame of monthly stock returns
-        excess_returns: DataFrame of monthly excess returns
-        betas: DataFrame of rolling betas
-        rf_rate: DataFrame of risk-free rates
-
-    Returns:
-        DataFrame with BAB portfolio returns and statistics
+    For low-beta portfolio: lower beta = higher weight
+    For high-beta portfolio: higher beta = higher weight
     """
-    print("\n" + "=" * 70)
-    print("Constructing BAB Portfolio with Beta Scaling")
-    print("Following Frazzini and Pedersen (2014) methodology")
-    print("=" * 70)
+    valid = betas.dropna()
+    if len(valid) == 0:
+        return pd.Series(dtype=float)
 
-    # Get common dates and tickers
-    common_dates = returns.index.intersection(betas.index).intersection(excess_returns.index)
-    common_tickers = returns.columns.intersection(betas.columns).intersection(excess_returns.columns)
+    # Rank betas (1 = lowest)
+    ranks = valid.rank(method='average')
 
-    print(f"  Common dates: {len(common_dates)}")
-    print(f"  Common tickers: {len(common_tickers)}")
+    if is_low_beta_portfolio:
+        # Lower beta = higher weight: use inverse rank
+        weights = len(ranks) - ranks + 1
+    else:
+        # Higher beta = higher weight: use direct rank
+        weights = ranks
 
-    returns = returns.loc[common_dates, common_tickers]
-    excess_returns = excess_returns.loc[common_dates, common_tickers]
-    betas = betas.loc[common_dates, common_tickers]
+    # Normalize to sum to 1
+    weights = weights / weights.sum()
+    return weights
 
-    # Results storage
+
+def construct_bab_portfolios(excess_returns, betas):
+    """
+    Construct monthly BAB portfolios following F&P (2014) Table 4.
+
+    For each month t:
+    1. Use betas from t-1 (lagged)
+    2. Split stocks at median beta into low-beta and high-beta groups
+    3. Weight stocks by beta rank within each group
+    4. Rescale both portfolios to beta=1
+    5. BAB = Long low-beta - Short high-beta
+    """
+    logger.info("Constructing BAB portfolios (F&P Table 4 methodology)...")
+
+    stock_cols = get_stock_columns(excess_returns)
+    common_dates = excess_returns.index.intersection(betas.index)
+    common_stocks = [col for col in stock_cols if col in betas.columns]
+
+    logger.info(f"Common dates: {len(common_dates)}, stocks: {len(common_stocks)}")
+
+    returns_aligned = excess_returns.loc[common_dates, common_stocks]
+    betas_aligned = betas.loc[common_dates, common_stocks]
+
     results = []
+    dates = sorted(common_dates)
 
-    # Process each month
-    for date in common_dates:
-        # Get beta values for this month (lagged - use previous month's beta)
-        # This avoids look-ahead bias: we form portfolios at the start of month t
-        # using betas computed at the end of month t-1
-        date_idx = common_dates.get_loc(date)
+    for i in range(1, len(dates)):
+        current_date = dates[i]
+        prev_date = dates[i-1]
 
-        if date_idx == 0:
-            continue  # Skip first month - no prior beta available
+        # Lagged betas (t-1) - NO LOOK-AHEAD
+        betas_lagged = betas_aligned.loc[prev_date]
+        returns_current = returns_aligned.loc[current_date]
 
-        prev_date = common_dates[date_idx - 1]
-        month_betas = betas.loc[prev_date]
+        # Valid stocks
+        valid_mask = betas_lagged.notna() & returns_current.notna()
+        valid_stocks = valid_mask[valid_mask].index
 
-        # Get returns for current month
-        month_returns = returns.loc[date]
-        month_excess = excess_returns.loc[date]
-
-        # Get stocks with both valid beta and return
-        valid_mask = month_betas.notna() & month_returns.notna() & month_excess.notna()
-        valid_tickers = valid_mask[valid_mask].index
-
-        if len(valid_tickers) < 20:  # Need enough stocks for meaningful quintiles
+        if len(valid_stocks) < MIN_STOCKS_PER_DECILE * 2:
             continue
 
-        valid_betas = month_betas[valid_tickers]
-        valid_returns = month_returns[valid_tickers]
-        valid_excess = month_excess[valid_tickers]
+        valid_betas = betas_lagged[valid_stocks]
+        valid_returns = returns_current[valid_stocks]
 
-        # Assign quintiles based on beta (1 = lowest, 5 = highest)
-        quintiles = assign_quintiles(valid_betas, n_quantiles=5)
+        # Split at median beta
+        median_beta = valid_betas.median()
+        low_beta_stocks = valid_betas[valid_betas < median_beta].index
+        high_beta_stocks = valid_betas[valid_betas >= median_beta].index
 
-        if len(quintiles) == 0:
+        if len(low_beta_stocks) < MIN_STOCKS_PER_DECILE or len(high_beta_stocks) < MIN_STOCKS_PER_DECILE:
             continue
 
-        # Calculate quintile statistics
-        q1_mask = quintiles == 1
-        q5_mask = quintiles == 5
+        # Beta-rank weights (F&P methodology)
+        low_weights = compute_beta_rank_weights(valid_betas[low_beta_stocks], is_low_beta_portfolio=True)
+        high_weights = compute_beta_rank_weights(valid_betas[high_beta_stocks], is_low_beta_portfolio=False)
 
-        if q1_mask.sum() == 0 or q5_mask.sum() == 0:
+        if low_weights.empty or high_weights.empty:
             continue
 
-        # Get tickers in each quintile
-        q1_tickers = quintiles[q1_mask].index
-        q5_tickers = quintiles[q5_mask].index
+        # Weighted returns and betas
+        r_L = (valid_returns[low_beta_stocks] * low_weights).sum()
+        r_H = (valid_returns[high_beta_stocks] * high_weights).sum()
+        beta_L = (valid_betas[low_beta_stocks] * low_weights).sum()
+        beta_H = (valid_betas[high_beta_stocks] * high_weights).sum()
 
-        # Calculate mean betas for Q1 (low) and Q5 (high)
-        q1_mean_beta = valid_betas[q1_tickers].mean()
-        q5_mean_beta = valid_betas[q5_tickers].mean()
-
-        # Skip if betas are too extreme or invalid
-        if q1_mean_beta <= 0.01 or q5_mean_beta <= 0.01:
-            continue
-        if np.isnan(q1_mean_beta) or np.isnan(q5_mean_beta):
+        if beta_L <= 0 or beta_H <= 0:
             continue
 
-        # Calculate equal-weighted returns for Q1 and Q5
-        q1_mean_return = valid_returns[q1_tickers].mean()
-        q5_mean_return = valid_returns[q5_tickers].mean()
+        # =================================================================
+        # DOLLAR-NEUTRAL BAB CONSTRUCTION
+        # =================================================================
+        # Raw weights to rescale each leg to beta=1
+        w_L_raw = 1.0 / beta_L
+        w_H_raw = 1.0 / beta_H
+        gross_raw = w_L_raw + w_H_raw
 
-        q1_mean_excess = valid_excess[q1_tickers].mean()
-        q5_mean_excess = valid_excess[q5_tickers].mean()
+        # Normalize to $2 gross exposure ($1 long + $1 short equivalent)
+        w_L = 2.0 * w_L_raw / gross_raw
+        w_H = 2.0 * w_H_raw / gross_raw
 
-        # ================================================================
-        # BETA SCALING - The key innovation of Frazzini-Pedersen
-        # ================================================================
-        # Scale returns by inverse of portfolio beta to achieve beta ≈ 1
-        # This creates market-neutral exposure
+        # BAB excess return (beta-neutral, controlled leverage)
+        bab_return = w_L * r_L - w_H * r_H
 
-        # Scaled returns (leverage/de-leverage)
-        q1_scaled_return = (1.0 / q1_mean_beta) * q1_mean_return
-        q5_scaled_return = (1.0 / q5_mean_beta) * q5_mean_return
+        # Ex-ante beta (should be ~0)
+        beta_ex_ante = w_L * beta_L - w_H * beta_H
 
-        q1_scaled_excess = (1.0 / q1_mean_beta) * q1_mean_excess
-        q5_scaled_excess = (1.0 / q5_mean_beta) * q5_mean_excess
+        # Dollar exposure tracking
+        dollar_net = w_L - w_H
 
-        # BAB return with scaling (market neutral)
-        bab_return_scaled = q1_scaled_return - q5_scaled_return
-        bab_excess_scaled = q1_scaled_excess - q5_scaled_excess
-
-        # BAB return without scaling (for comparison - NOT market neutral)
-        bab_return_unscaled = q1_mean_return - q5_mean_return
-
-        # Ex-ante portfolio beta (should be close to 0)
-        # Long (1/β_L) × β_L = 1, Short (1/β_H) × β_H = 1
-        # Net beta = 1 - 1 = 0 (by construction)
-        # But we can compute realized beta for verification
-        portfolio_beta_exante = (1.0 / q1_mean_beta) * q1_mean_beta - (1.0 / q5_mean_beta) * q5_mean_beta
-
-        # Compute leverage applied
-        long_leverage = 1.0 / q1_mean_beta
-        short_leverage = 1.0 / q5_mean_beta
-
-        # Store results
         results.append({
-            'Date': date,
-            # Scaled BAB returns (main strategy)
-            'BAB_Return': bab_return_scaled,
-            'BAB_Excess_Return': bab_excess_scaled,
-            # Unscaled for comparison
-            'BAB_Return_Unscaled': bab_return_unscaled,
-            # Portfolio betas
-            'Q1_Mean_Beta': q1_mean_beta,
-            'Q5_Mean_Beta': q5_mean_beta,
-            'Portfolio_Beta_ExAnte': portfolio_beta_exante,  # Should be ~0
-            # Raw returns
-            'Q1_Mean_Return': q1_mean_return,
-            'Q5_Mean_Return': q5_mean_return,
-            # Scaled returns
-            'Q1_Scaled_Return': q1_scaled_return,
-            'Q5_Scaled_Return': q5_scaled_return,
-            # Leverage factors
-            'Long_Leverage': long_leverage,
-            'Short_Leverage': short_leverage,
-            # Portfolio sizes
-            'N_Q1': len(q1_tickers),
-            'N_Q5': len(q5_tickers),
-            'N_Total': len(valid_tickers),
-            # Beta spread
-            'Beta_Spread': q5_mean_beta - q1_mean_beta,
+            'Date': current_date,
+            'BAB_Return': bab_return,
+            'BAB_Excess_Return': bab_return,
+            'Beta_L': beta_L,
+            'Beta_H': beta_H,
+            'Beta_Spread': beta_H - beta_L,
+            'R_L': r_L,
+            'R_H': r_H,
+            'W_L': w_L,
+            'W_H': w_H,
+            'Beta_ExAnte': beta_ex_ante,
+            'Dollar_Net': dollar_net,
+            'Gross_Exposure': w_L + w_H,
+            'N_Low': len(low_beta_stocks),
+            'N_High': len(high_beta_stocks),
+            'N_Total': len(valid_stocks),
         })
 
-    # Create results DataFrame
-    results_df = pd.DataFrame(results)
-    results_df['Date'] = pd.to_datetime(results_df['Date'])
-    results_df = results_df.set_index('Date')
+    if not results:
+        logger.warning("No valid BAB portfolios constructed!")
+        return pd.DataFrame()
 
-    print(f"\nBAB portfolio constructed:")
-    print(f"  Months with valid portfolios: {len(results_df)}")
-    print(f"  Date range: {results_df.index.min()} to {results_df.index.max()}")
-    print(f"  Mean ex-ante portfolio beta: {results_df['Portfolio_Beta_ExAnte'].mean():.4f}")
+    bab_df = pd.DataFrame(results)
+    bab_df.set_index('Date', inplace=True)
+    bab_df.index = pd.to_datetime(bab_df.index)
 
-    return results_df
+    logger.info(f"Constructed BAB: {len(bab_df)} months")
+    logger.info(f"Ex-ante beta: mean={bab_df['Beta_ExAnte'].mean():.6f}")
+    logger.info(f"Dollar net: mean={bab_df['Dollar_Net'].mean():.3f}")
+
+    return bab_df
 
 
-def compute_quintile_statistics(returns: pd.DataFrame, betas: pd.DataFrame) -> pd.DataFrame:
-    """
-    Compute detailed statistics for each quintile across all months.
+def compute_decile_returns(excess_returns, betas):
+    """Compute equal-weighted returns for each decile (D1-D10)."""
+    logger.info("Computing decile returns...")
 
-    Args:
-        returns: DataFrame of monthly stock returns
-        betas: DataFrame of rolling betas
+    stock_cols = get_stock_columns(excess_returns)
+    common_dates = excess_returns.index.intersection(betas.index)
+    common_stocks = [col for col in stock_cols if col in betas.columns]
 
-    Returns:
-        DataFrame with quintile-level statistics
-    """
-    print("\nComputing quintile statistics...")
+    returns_aligned = excess_returns.loc[common_dates, common_stocks]
+    betas_aligned = betas.loc[common_dates, common_stocks]
 
-    common_dates = returns.index.intersection(betas.index)
-    common_tickers = returns.columns.intersection(betas.columns)
+    results = []
+    dates = sorted(common_dates)
 
-    returns = returns.loc[common_dates, common_tickers]
-    betas = betas.loc[common_dates, common_tickers]
+    for i in range(1, len(dates)):
+        current_date = dates[i]
+        prev_date = dates[i-1]
 
-    all_quintile_stats = []
+        betas_lagged = betas_aligned.loc[prev_date]
+        returns_current = returns_aligned.loc[current_date]
 
-    for date in common_dates:
-        date_idx = common_dates.get_loc(date)
+        valid_mask = betas_lagged.notna() & returns_current.notna()
+        valid_stocks = valid_mask[valid_mask].index
 
-        if date_idx == 0:
+        if len(valid_stocks) < NUM_DECILES * MIN_STOCKS_PER_DECILE:
             continue
 
-        prev_date = common_dates[date_idx - 1]
-        month_betas = betas.loc[prev_date]
-        month_returns = returns.loc[date]
-
-        valid_mask = month_betas.notna() & month_returns.notna()
-        valid_tickers = valid_mask[valid_mask].index
-
-        if len(valid_tickers) < 20:
+        deciles = assign_deciles(betas_lagged[valid_stocks])
+        if deciles.empty:
             continue
 
-        valid_betas = month_betas[valid_tickers]
-        valid_returns = month_returns[valid_tickers]
+        row = {'Date': current_date}
 
-        quintiles = assign_quintiles(valid_betas, n_quantiles=5)
+        for d in range(1, NUM_DECILES + 1):
+            d_stocks = deciles[deciles == d].index
+            if len(d_stocks) > 0:
+                row[f'D{d}_Return'] = returns_current[d_stocks].mean()
+                row[f'D{d}_Beta'] = betas_lagged[d_stocks].mean()
+                row[f'D{d}_N'] = len(d_stocks)
+            else:
+                row[f'D{d}_Return'] = np.nan
+                row[f'D{d}_Beta'] = np.nan
+                row[f'D{d}_N'] = 0
 
-        if len(quintiles) == 0:
-            continue
+        results.append(row)
 
-        # Compute stats for each quintile
-        for q in range(1, 6):
-            q_mask = quintiles == q
-            if q_mask.sum() == 0:
-                continue
+    if not results:
+        return pd.DataFrame()
 
-            q_tickers = quintiles[q_mask].index
-            q_betas = valid_betas[q_tickers]
-            q_returns = valid_returns[q_tickers]
+    decile_df = pd.DataFrame(results)
+    decile_df.set_index('Date', inplace=True)
+    decile_df.index = pd.to_datetime(decile_df.index)
 
-            all_quintile_stats.append({
-                'Date': date,
-                'Quintile': q,
-                'N_Stocks': len(q_tickers),
-                'Mean_Beta': q_betas.mean(),
-                'Median_Beta': q_betas.median(),
-                'Min_Beta': q_betas.min(),
-                'Max_Beta': q_betas.max(),
-                'Std_Beta': q_betas.std(),
-                'Mean_Return': q_returns.mean(),
-                'Median_Return': q_returns.median(),
-                'Std_Return': q_returns.std(),
-                # Scaled return (as if beta = 1)
-                'Scaled_Return': q_returns.mean() / q_betas.mean() if q_betas.mean() > 0.01 else np.nan,
-            })
-
-    stats_df = pd.DataFrame(all_quintile_stats)
-    stats_df['Date'] = pd.to_datetime(stats_df['Date'])
-
-    print(f"  Generated {len(stats_df)} quintile-month observations")
-
-    return stats_df
+    logger.info(f"Decile returns: {len(decile_df)} months")
+    return decile_df
 
 
-def verify_market_neutrality(bab_returns: pd.DataFrame, iwv_returns: pd.DataFrame) -> dict:
-    """
-    Verify that the scaled BAB portfolio is approximately market neutral.
+def save_outputs(bab_df, decile_df):
+    """Save outputs to CSV."""
+    ensure_directories()
 
-    This is done by regressing BAB returns on market returns.
-    Beta should be close to 0 if scaling is working correctly.
+    if not bab_df.empty:
+        bab_path = os.path.join(OUTPUT_DIR, 'bab_portfolio.csv')
+        bab_df.to_csv(bab_path)
+        logger.info(f"Saved: {bab_path}")
 
-    Args:
-        bab_returns: DataFrame with BAB returns
-        iwv_returns: DataFrame with IWV (market) returns
-
-    Returns:
-        Dictionary with regression statistics
-    """
-    print("\nVerifying market neutrality of scaled BAB portfolio...")
-
-    common_idx = bab_returns.index.intersection(iwv_returns.index)
-    bab = bab_returns.loc[common_idx, 'BAB_Return'].dropna()
-    iwv = iwv_returns.loc[common_idx, 'IWV'].dropna()
-
-    # Align
-    common = bab.index.intersection(iwv.index)
-    bab = bab.loc[common]
-    iwv = iwv.loc[common]
-
-    # Simple regression: BAB = alpha + beta * IWV + epsilon
-    cov = bab.cov(iwv)
-    var = iwv.var()
-    beta = cov / var if var > 0 else np.nan
-    alpha = bab.mean() - beta * iwv.mean()
-
-    # R-squared
-    y_pred = alpha + beta * iwv
-    ss_res = ((bab - y_pred) ** 2).sum()
-    ss_tot = ((bab - bab.mean()) ** 2).sum()
-    r_squared = 1 - ss_res / ss_tot if ss_tot > 0 else np.nan
-
-    # Correlation
-    correlation = bab.corr(iwv)
-
-    # T-statistic for beta
-    n = len(bab)
-    if n > 2:
-        residuals = bab - y_pred
-        se_beta = np.sqrt(residuals.var() / ((n - 2) * var)) if var > 0 else np.nan
-        t_stat = beta / se_beta if se_beta > 0 else np.nan
-    else:
-        t_stat = np.nan
-
-    results = {
-        'Market_Beta': beta,
-        'Alpha_Monthly': alpha,
-        'Alpha_Annualized': alpha * 12,
-        'R_Squared': r_squared,
-        'Correlation': correlation,
-        'T_Stat_Beta': t_stat,
-        'N_Observations': n,
-    }
-
-    print(f"  Market Beta: {beta:.4f} (should be ~0)")
-    print(f"  Correlation with Market: {correlation:.4f}")
-    print(f"  Monthly Alpha: {alpha*100:.3f}%")
-    print(f"  Annualized Alpha: {alpha*12*100:.2f}%")
-
-    if abs(beta) < 0.3:
-        print("  ✓ Portfolio is approximately market neutral")
-    else:
-        print("  ⚠ Portfolio has significant market exposure")
-
-    return results
+    if not decile_df.empty:
+        decile_path = os.path.join(OUTPUT_DIR, 'decile_returns.csv')
+        decile_df.to_csv(decile_path)
+        logger.info(f"Saved: {decile_path}")
 
 
-def print_summary_statistics(bab_returns: pd.DataFrame) -> None:
-    """Print summary statistics of BAB portfolio."""
-    print("\n" + "=" * 70)
-    print("BAB Portfolio Summary Statistics")
-    print("=" * 70)
+def print_summary(bab_df, decile_df):
+    """Print summary statistics."""
+    print("\n" + "=" * 60)
+    print("BAB Portfolio Summary (F&P 2014 Methodology)")
+    print("=" * 60)
 
-    bab_scaled = bab_returns['BAB_Return']
-    bab_unscaled = bab_returns['BAB_Return_Unscaled']
+    if bab_df.empty:
+        print("No portfolios constructed.")
+        return
 
-    print(f"\nSCALED BAB Return Statistics (Market Neutral):")
-    print(f"  Mean Monthly Return: {bab_scaled.mean()*100:.3f}%")
-    print(f"  Median Monthly Return: {bab_scaled.median()*100:.3f}%")
-    print(f"  Std Dev (Monthly): {bab_scaled.std()*100:.3f}%")
-    print(f"  Annualized Return: {bab_scaled.mean()*12*100:.2f}%")
-    print(f"  Annualized Volatility: {bab_scaled.std()*np.sqrt(12)*100:.2f}%")
-    print(f"  Sharpe Ratio (rf=0): {bab_scaled.mean()/bab_scaled.std()*np.sqrt(12):.3f}")
+    print(f"\nPeriod: {bab_df.index.min():%Y-%m} to {bab_df.index.max():%Y-%m}")
+    print(f"Months: {len(bab_df)}")
 
-    print(f"\nUNSCALED BAB Return Statistics (for comparison):")
-    print(f"  Mean Monthly Return: {bab_unscaled.mean()*100:.3f}%")
-    print(f"  Annualized Return: {bab_unscaled.mean()*12*100:.2f}%")
+    print("\n--- Beta Statistics ---")
+    print(f"Avg Low-Beta:     {bab_df['Beta_L'].mean():.3f}")
+    print(f"Avg High-Beta:    {bab_df['Beta_H'].mean():.3f}")
+    print(f"Avg Beta Spread:  {bab_df['Beta_Spread'].mean():.3f}")
 
-    print(f"\nBeta Statistics:")
-    print(f"  Mean Q1 (Low) Beta: {bab_returns['Q1_Mean_Beta'].mean():.3f}")
-    print(f"  Mean Q5 (High) Beta: {bab_returns['Q5_Mean_Beta'].mean():.3f}")
-    print(f"  Mean Beta Spread (Q5-Q1): {bab_returns['Beta_Spread'].mean():.3f}")
+    print("\n--- Portfolio Weights ---")
+    print(f"Avg Long Weight:   ${bab_df['W_L'].mean():.3f}")
+    print(f"Avg Short Weight:  ${bab_df['W_H'].mean():.3f}")
+    print(f"Avg Gross:         ${bab_df['Gross_Exposure'].mean():.3f}")
+    print(f"Avg Net Dollar:    ${bab_df['Dollar_Net'].mean():.4f}")
 
-    print(f"\nLeverage Statistics:")
-    print(f"  Mean Long Leverage (1/β_L): {bab_returns['Long_Leverage'].mean():.2f}x")
-    print(f"  Mean Short Leverage (1/β_H): {bab_returns['Short_Leverage'].mean():.2f}x")
+    print("\n--- Market Neutrality ---")
+    print(f"Ex-Ante Beta:      {bab_df['Beta_ExAnte'].mean():.6f} (should be ~0)")
 
-    print(f"\nPortfolio Composition:")
-    print(f"  Avg Stocks in Q1: {bab_returns['N_Q1'].mean():.1f}")
-    print(f"  Avg Stocks in Q5: {bab_returns['N_Q5'].mean():.1f}")
-    print(f"  Avg Total Stocks: {bab_returns['N_Total'].mean():.1f}")
+    print("\n--- Return Statistics ---")
+    bab_ret = bab_df['BAB_Return']
+    ann_ret = bab_ret.mean() * 12
+    ann_vol = bab_ret.std() * np.sqrt(12)
+    sharpe = ann_ret / ann_vol if ann_vol > 0 else 0
+    t_stat = bab_ret.mean() / (bab_ret.std() / np.sqrt(len(bab_ret))) if bab_ret.std() > 0 else 0
 
-    # Win rate
-    win_rate = (bab_scaled > 0).sum() / len(bab_scaled) * 100
-    print(f"\nPerformance:")
-    print(f"  Win Rate: {win_rate:.1f}%")
-    print(f"  Positive Months: {(bab_scaled > 0).sum()}")
-    print(f"  Negative Months: {(bab_scaled <= 0).sum()}")
+    print(f"Monthly Return:    {bab_ret.mean()*100:.3f}% (t={t_stat:.2f})")
+    print(f"Annualized Return: {ann_ret*100:.2f}%")
+    print(f"Annualized Vol:    {ann_vol*100:.2f}%")
+    print(f"Sharpe Ratio:      {sharpe:.3f}")
+
+    print("\n--- Decile Average Returns ---")
+    if not decile_df.empty:
+        for d in range(1, NUM_DECILES + 1):
+            col = f'D{d}_Return'
+            if col in decile_df.columns:
+                avg_ret = decile_df[col].mean() * 100
+                print(f"D{d}: {avg_ret:>7.3f}%/month")
+
+    print("\n" + "=" * 60)
 
 
 def main():
-    """Main function to execute portfolio construction."""
-    print("=" * 70)
-    print("BAB Portfolio Construction")
-    print("Frazzini-Pedersen (2014) Replication with Beta Scaling")
-    print("=" * 70)
+    """Main pipeline."""
+    logger.info("=" * 60)
+    logger.info("Portfolio Construction - F&P (2014)")
+    logger.info("=" * 60)
 
-    # Create output directory
-    ensure_output_dir()
+    ensure_directories()
 
-    # Load data
-    returns, excess_returns, betas, iwv_returns, iwv_excess, rf_rate = load_data()
+    excess_returns, betas = load_data()
+    bab_df = construct_bab_portfolios(excess_returns, betas)
+    decile_df = compute_decile_returns(excess_returns, betas)
+    save_outputs(bab_df, decile_df)
+    print_summary(bab_df, decile_df)
 
-    # Construct BAB portfolio with scaling
-    bab_returns = construct_bab_portfolio_with_scaling(
-        returns, excess_returns, betas, rf_rate
-    )
-
-    # Compute quintile statistics
-    quintile_stats = compute_quintile_statistics(returns, betas)
-
-    # Add IWV returns to BAB DataFrame for comparison
-    common_dates = bab_returns.index.intersection(iwv_returns.index)
-    bab_returns = bab_returns.loc[common_dates]
-    bab_returns['IWV_Return'] = iwv_returns.loc[common_dates, 'IWV']
-
-    # Verify market neutrality
-    neutrality_stats = verify_market_neutrality(bab_returns, iwv_returns)
-    bab_returns['Realized_Market_Beta'] = neutrality_stats['Market_Beta']
-
-    # Save outputs
-    print("\nSaving outputs...")
-
-    bab_returns.to_csv(BAB_RETURNS_FILE)
-    print(f"  Saved: {BAB_RETURNS_FILE}")
-
-    quintile_stats.to_csv(QUINTILE_STATS_FILE, index=False)
-    print(f"  Saved: {QUINTILE_STATS_FILE}")
-
-    # Print summary statistics
-    print_summary_statistics(bab_returns)
-
-    print("\n" + "=" * 70)
-    print("Portfolio construction complete!")
-    print("=" * 70)
+    logger.info("Portfolio construction complete!")
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

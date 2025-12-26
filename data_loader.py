@@ -1,771 +1,351 @@
-#!/usr/bin/env python3
 """
-data_loader.py - Betting-Against-Beta (BAB) Strategy Data Loader
+data_loader.py - Download and prepare data for Betting-Against-Beta strategy
 
-Replication of Frazzini and Pedersen (2014) "Betting Against Beta"
-Journal of Financial Economics, 111(1), 1-25.
-
-================================================================================
-SURVIVORSHIP BIAS DECLARATION
-================================================================================
-
-IMPORTANT: This implementation uses TODAY'S Russell 3000 constituents (via iShares
-IWV ETF holdings) applied historically back to January 2000. This introduces
-SURVIVORSHIP BIAS with the following implications:
-
-1. OVERESTIMATION OF LOW-BETA PERFORMANCE:
-   - Stocks that survived to today are disproportionately successful
-   - Low-beta "boring" stocks that failed (e.g., Kodak, Sears) are excluded
-   - This biases low-beta portfolio returns upward
-
-2. UNDERREPRESENTATION OF DISTRESSED HIGH-BETA STOCKS:
-   - Failed high-beta stocks (e.g., Enron, WorldCom, Lehman) are excluded
-   - High-beta portfolios miss their most negative outcomes
-   - This biases high-beta portfolio returns upward (less negative than reality)
-   - Net effect: BAB spread may be SMALLER than true historical spread
-
-3. UNIVERSE SIZE MISMATCH:
-   - Russell 3000 in 2000 had different constituents than today
-   - We use ~3000 current survivors across entire period
-   - True implementable strategy would have different stocks each year
-
-4. SECTOR COMPOSITION CHANGES:
-   - Tech sector weight much higher today than in 2000
-   - Financial sector composition changed dramatically post-2008
-   - Energy sector evolved with shale revolution
-
-MITIGATION: Despite these biases, the BAB factor has been documented across:
-- Multiple countries and time periods (Frazzini-Pedersen 2014)
-- Different universes with point-in-time constituents
-- Out-of-sample periods following original publication
-
-The survivorship-biased results here should be interpreted as INDICATIVE rather
-than definitive evidence of the BAB premium.
-
-================================================================================
-
-This script downloads and prepares all data required for the BAB strategy:
-1. Downloads current Russell 3000 tickers from iShares IWV holdings CSV
-2. Cleans invalid symbols and retains only standard stock tickers
-3. Fetches monthly adjusted close prices for all tickers, IWV, and ^IRX
-4. Downloads Fama-French factor data for factor regressions
-5. Computes and saves:
-   - Monthly prices (wide DataFrame)
-   - Simple monthly returns (pct_change)
-   - Monthly excess returns (return - risk-free rate)
-   - Rolling 60-month betas (minimum 36 months required for valid estimate)
-
-Author: BAB Strategy Implementation (Frazzini-Pedersen Replication)
-Date: 2024
+Implements Frazzini & Pedersen (2014) beta calculation:
+- Correlation: 12-month rolling window
+- Volatility: 60-month rolling window
+- Beta = correlation * (vol_stock / vol_market)
+- Shrinkage: 0.6 * beta_TS + 0.4 * 1.0
 """
 
-import os
-import re
-import warnings
-from datetime import datetime
-from typing import Optional, Tuple
-from io import StringIO
-
-import numpy as np
 import pandas as pd
-import requests
+import numpy as np
 import yfinance as yf
+import os
+import io
+import zipfile
+import warnings
+import logging
 
 warnings.filterwarnings('ignore')
 
-# Configuration
-DATA_DIR = "data"
-START_DATE = "2000-01-01"
-END_DATE = datetime.today().strftime("%Y-%m-%d")
-ROLLING_WINDOW = 60  # months for beta calculation (Frazzini-Pedersen use 60 months)
-MIN_PERIODS = 36     # minimum months required for valid beta estimate
-IWV_HOLDINGS_URL = "https://www.ishares.com/us/products/239714/ishares-russell-3000-etf/1467271812596.ajax?fileType=csv&fileName=IWV_holdings&dataType=fund"
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-# Fama-French data URL (Ken French's data library)
-FF_FACTORS_URL = "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/F-F_Research_Data_5_Factors_2x3_CSV.zip"
-FF_MOMENTUM_URL = "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/F-F_Momentum_Factor_CSV.zip"
-
-# Output file paths
-PRICES_FILE = os.path.join(DATA_DIR, "monthly_prices.csv")
-RETURNS_FILE = os.path.join(DATA_DIR, "monthly_returns.csv")
-EXCESS_RETURNS_FILE = os.path.join(DATA_DIR, "monthly_excess_returns.csv")
-BETAS_FILE = os.path.join(DATA_DIR, "rolling_betas.csv")
-RF_RATE_FILE = os.path.join(DATA_DIR, "risk_free_rate.csv")
-IWV_RETURNS_FILE = os.path.join(DATA_DIR, "iwv_returns.csv")
-IWV_EXCESS_RETURNS_FILE = os.path.join(DATA_DIR, "iwv_excess_returns.csv")
-TICKERS_FILE = os.path.join(DATA_DIR, "tickers.csv")
-FF_FACTORS_FILE = os.path.join(DATA_DIR, "ff_factors.csv")
-SURVIVORSHIP_BIAS_FILE = os.path.join(DATA_DIR, "SURVIVORSHIP_BIAS_WARNING.txt")
+from config import (
+    START_DATE, END_DATE, DATA_DIR, BENCHMARK_TICKER, RUSSELL_3000_TICKERS,
+    DOWNLOAD_BATCH_SIZE, ensure_directories, KEN_FRENCH_URL,
+    MIN_DATA_COVERAGE, MAX_GAP_MONTHS, REQUIRE_FULL_HISTORY,
+    CORRELATION_WINDOW, VOLATILITY_WINDOW, MIN_PERIODS_CORR, MIN_PERIODS_VOL,
+    SHRINKAGE_FACTOR, PRIOR_BETA, WINSORIZE_PERCENTILE
+)
 
 
-def ensure_data_dir() -> None:
-    """Create data directory if it doesn't exist."""
-    if not os.path.exists(DATA_DIR):
-        os.makedirs(DATA_DIR)
-        print(f"Created data directory: {DATA_DIR}")
-
-
-def write_survivorship_bias_warning() -> None:
-    """Write survivorship bias warning file."""
-    warning_text = """
-================================================================================
-SURVIVORSHIP BIAS WARNING
-================================================================================
-
-This dataset uses TODAY'S Russell 3000 constituents applied historically.
-
-IMPLICATIONS:
-1. Low-beta returns are OVERESTIMATED (failed boring stocks excluded)
-2. High-beta returns are LESS NEGATIVE than reality (failed speculative stocks excluded)
-3. The BAB spread may be UNDERESTIMATED or OVERESTIMATED depending on net effect
-4. Results should be interpreted as INDICATIVE, not definitive
-
-For rigorous academic research, use point-in-time constituent data from:
-- CRSP (Center for Research in Security Prices)
-- Compustat
-- Bloomberg Point-in-Time data
-
-Generated: {date}
-Universe: Russell 3000 (IWV ETF Holdings as of download date)
-Period: {start} to {end}
-================================================================================
-""".format(date=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-           start=START_DATE, end=END_DATE)
-
-    with open(SURVIVORSHIP_BIAS_FILE, 'w') as f:
-        f.write(warning_text)
-    print(f"Wrote survivorship bias warning to {SURVIVORSHIP_BIAS_FILE}")
-
-
-def download_iwv_holdings() -> pd.DataFrame:
+def download_ken_french_rf():
     """
-    Download current iShares IWV (Russell 3000 ETF) holdings from iShares website.
-
-    NOTE: This uses TODAY'S constituents, introducing survivorship bias.
+    Download 1-month T-bill rate from Ken French Data Library.
 
     Returns:
-        DataFrame with ticker symbols and other holdings information.
+        pd.Series: Monthly risk-free rate as decimal
     """
-    print("Downloading IWV holdings from iShares...")
-    print("  WARNING: Using current constituents (survivorship bias)")
-
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-    }
+    logger.info("Downloading risk-free rate from Ken French Data Library...")
 
     try:
-        response = requests.get(IWV_HOLDINGS_URL, headers=headers, timeout=30)
-        response.raise_for_status()
+        import urllib.request
+        response = urllib.request.urlopen(KEN_FRENCH_URL, timeout=30)
+        zip_data = response.read()
 
-        # Parse CSV content - skip metadata rows at the top
-        lines = response.text.split('\n')
+        with zipfile.ZipFile(io.BytesIO(zip_data)) as z:
+            csv_name = [n for n in z.namelist() if n.endswith('.csv') or n.endswith('.CSV')][0]
+            with z.open(csv_name) as f:
+                lines = f.read().decode('utf-8').split('\n')
 
-        # Find the header row (contains 'Ticker' column)
-        header_idx = 0
+        # Find data section (skip header)
+        data_start = 0
         for i, line in enumerate(lines):
-            if 'Ticker' in line:
-                header_idx = i
+            if line.strip() and line.strip()[0].isdigit():
+                data_start = i
                 break
 
-        # Read from the header row onwards
-        csv_content = '\n'.join(lines[header_idx:])
-        holdings = pd.read_csv(StringIO(csv_content))
+        # Parse monthly data
+        rf_data = []
+        for line in lines[data_start:]:
+            parts = line.strip().split(',')
+            if len(parts) >= 5 and len(parts[0]) == 6:
+                try:
+                    date_str = parts[0]
+                    rf_value = float(parts[4]) / 100  # Convert from percentage
+                    year = int(date_str[:4])
+                    month = int(date_str[4:6])
+                    date = pd.Timestamp(year=year, month=month, day=1) + pd.offsets.MonthEnd(0)
+                    rf_data.append({'Date': date, 'RF': rf_value})
+                except (ValueError, IndexError):
+                    continue
 
-        print(f"Downloaded {len(holdings)} holdings from IWV")
-        return holdings
+        rf_df = pd.DataFrame(rf_data)
+        rf_df.set_index('Date', inplace=True)
+        rf_series = rf_df['RF']
+        rf_series.name = 'RF_Rate'
+
+        logger.info(f"Ken French RF: {len(rf_series)} months, avg={rf_series.mean()*100:.3f}%/month")
+        return rf_series
 
     except Exception as e:
-        print(f"Error downloading IWV holdings: {e}")
-        print("Attempting alternative approach...")
-        return download_iwv_holdings_alternative()
+        logger.warning(f"Ken French download failed: {e}")
+        logger.warning("Falling back to Yahoo ^IRX")
+        return download_yahoo_rf()
 
 
-def download_iwv_holdings_alternative() -> pd.DataFrame:
-    """
-    Alternative method to get Russell 3000 constituents.
-    Falls back to Wikipedia S&P 500 + curated mid/small cap list.
-    """
-    print("Using alternative method to fetch Russell 3000 constituents...")
-
-    # Get S&P 500 as a base (major large caps)
+def download_yahoo_rf():
+    """Fallback: Download 3-month T-bill rate from Yahoo Finance."""
     try:
-        sp500_url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-        sp500_tables = pd.read_html(sp500_url)
-        sp500_tickers = sp500_tables[0]['Symbol'].tolist()
-    except Exception:
-        sp500_tickers = []
+        data = yf.download('^IRX', start=START_DATE, end=END_DATE, interval='1d', progress=False)
+        if data.empty:
+            raise ValueError("No ^IRX data")
 
-    # Comprehensive list covering various sectors and market caps
-    additional_tickers = [
-        # Large Cap Technology
-        'AAPL', 'MSFT', 'GOOGL', 'GOOG', 'META', 'NVDA', 'AMD', 'INTC', 'CRM', 'ADBE',
-        'ORCL', 'CSCO', 'IBM', 'QCOM', 'TXN', 'AVGO', 'NOW', 'INTU', 'AMAT', 'MU',
-        'ADI', 'LRCX', 'KLAC', 'SNPS', 'CDNS', 'MRVL', 'FTNT', 'PANW', 'CRWD', 'ZS',
-        # Healthcare
-        'JNJ', 'UNH', 'PFE', 'ABBV', 'MRK', 'LLY', 'TMO', 'ABT', 'DHR', 'BMY',
-        'AMGN', 'GILD', 'CVS', 'MDT', 'ISRG', 'VRTX', 'REGN', 'BSX', 'EW', 'ZTS',
-        'DXCM', 'IDXX', 'IQV', 'MTD', 'STE', 'HOLX', 'ALGN', 'TECH', 'BIO', 'PKI',
-        # Financials
-        'JPM', 'BAC', 'WFC', 'C', 'GS', 'MS', 'BLK', 'SCHW', 'AXP', 'USB',
-        'PNC', 'TFC', 'COF', 'BK', 'STT', 'FITB', 'KEY', 'RF', 'CFG', 'HBAN',
-        'MTB', 'ZION', 'CMA', 'WAL', 'EWBC', 'FHN', 'SNV', 'BOKF', 'CBSH', 'UMBF',
-        # Consumer Discretionary
-        'AMZN', 'TSLA', 'HD', 'NKE', 'MCD', 'SBUX', 'LOW', 'TJX', 'BKNG', 'CMG',
-        'MAR', 'HLT', 'YUM', 'DPZ', 'ORLY', 'AZO', 'ROST', 'DG', 'DLTR', 'BBY',
-        'ULTA', 'POOL', 'WSM', 'RH', 'FIVE', 'BOOT', 'PLNT', 'WING', 'SHAK', 'TXRH',
-        # Consumer Staples
-        'PG', 'KO', 'PEP', 'COST', 'WMT', 'PM', 'MO', 'MDLZ', 'CL', 'KMB',
-        'GIS', 'K', 'HSY', 'SJM', 'CAG', 'CPB', 'HRL', 'MKC', 'TSN', 'KHC',
-        # Industrials
-        'UPS', 'UNP', 'HON', 'CAT', 'RTX', 'BA', 'LMT', 'GE', 'MMM', 'DE',
-        'FDX', 'CSX', 'NSC', 'WM', 'RSG', 'EMR', 'ETN', 'ITW', 'PH', 'ROK',
-        'CMI', 'PCAR', 'FAST', 'ODFL', 'JBHT', 'XPO', 'CHRW', 'EXPD', 'SAIA', 'WERN',
-        # Energy
-        'XOM', 'CVX', 'COP', 'SLB', 'EOG', 'MPC', 'VLO', 'PSX', 'PXD', 'OXY',
-        'DVN', 'HES', 'FANG', 'APA', 'HAL', 'BKR', 'OKE', 'WMB', 'KMI', 'ET',
-        # Materials
-        'LIN', 'APD', 'SHW', 'ECL', 'NEM', 'FCX', 'DOW', 'DD', 'PPG', 'VMC',
-        'MLM', 'NUE', 'STLD', 'CF', 'MOS', 'ALB', 'FMC', 'CE', 'EMN', 'SEE',
-        # Utilities (typically low beta)
-        'NEE', 'DUK', 'SO', 'D', 'AEP', 'EXC', 'SRE', 'XEL', 'ED', 'WEC',
-        'ES', 'PEG', 'AWK', 'AEE', 'CMS', 'DTE', 'FE', 'PPL', 'EVRG', 'ATO',
-        # Real Estate
-        'AMT', 'PLD', 'CCI', 'EQIX', 'PSA', 'SPG', 'O', 'WELL', 'DLR', 'AVB',
-        'EQR', 'VTR', 'ARE', 'MAA', 'UDR', 'ESS', 'HST', 'REG', 'KIM', 'IRM',
-        # Communication Services
-        'DIS', 'NFLX', 'CMCSA', 'VZ', 'T', 'TMUS', 'CHTR', 'EA', 'TTWO',
-        'PARA', 'FOX', 'FOXA', 'LYV', 'MTCH', 'PINS', 'SNAP', 'ROKU',
-        # Mid/Small Cap Tech
-        'BILL', 'HUBS', 'DDOG', 'NET', 'MDB', 'SNOW', 'PLTR', 'PATH', 'DOCN',
-        'TEAM', 'WDAY', 'VEEV', 'PCTY', 'PAYC', 'PAYX', 'ADP', 'EPAM', 'GLOB',
-        'GPN', 'FIS', 'FISV', 'PYPL', 'DOCU', 'BOX', 'TWLO', 'OKTA', 'ZM',
-        # Mid/Small Cap Healthcare
-        'BIIB', 'MRNA', 'ALNY', 'INCY', 'EXEL', 'BMRN', 'SRPT', 'IONS', 'NBIX',
-        'SYK', 'ZBH', 'BAX', 'BDX', 'RMD', 'COO', 'TFX', 'PODD', 'LIVN',
-        # Insurance
-        'BRK-B', 'ALL', 'PGR', 'TRV', 'CB', 'MET', 'PRU', 'AFL', 'AIG', 'LNC',
-        'HIG', 'GL', 'UNM', 'VOYA', 'AIZ', 'RGA', 'RNR',
-        # Retailers
-        'KSS', 'M', 'JWN', 'GPS', 'ANF', 'AEO', 'URBN', 'BURL', 'DKS', 'HIBB',
-        # Autos and Transports
-        'F', 'GM', 'RIVN', 'APTV', 'BWA', 'LEA', 'LKQ',
-        'DAL', 'UAL', 'LUV', 'AAL', 'ALK', 'JBLU',
-        'EXPE', 'ABNB', 'RCL', 'CCL', 'NCLH',
-        # Construction and Homebuilders
-        'LEN', 'DHI', 'PHM', 'NVR', 'TOL', 'KBH', 'TMHC',
-        'BLD', 'BLDR', 'BECN', 'GMS',
-        # Defense
-        'NOC', 'GD', 'LHX', 'HII', 'TXT', 'TDG', 'HEI', 'AXON',
-        'LDOS', 'SAIC', 'BAH',
-        # Semiconductors
-        'TSM', 'ASML', 'NXPI', 'MCHP', 'ON', 'SWKS', 'QRVO',
-        'MPWR', 'CRUS', 'LSCC',
-        # Additional diversified
-        'GWW', 'HUBB', 'IDEX', 'IEX', 'ITT', 'NDSN', 'OTIS', 'PCAR',
-        'RPM', 'SNA', 'SWK', 'TTC', 'WAB', 'XYL', 'ZBH', 'ZBRA',
-        'MAN', 'RHI', 'HSIC', 'OMC', 'IPG',
-        'MORN', 'MSCI', 'SPGI', 'MCO', 'INFO',
-    ]
+        rf_daily = data['Close'].iloc[:, 0] if isinstance(data.columns, pd.MultiIndex) else data['Close']
+        rf_daily.index = pd.to_datetime(rf_daily.index)
+        rf_monthly = rf_daily.resample('ME').last()
+        rf_monthly_decimal = (1 + rf_monthly / 100) ** (1/12) - 1
+        rf_monthly_decimal.name = 'RF_Rate'
 
-    # Combine and deduplicate
-    all_tickers = list(set(sp500_tickers + additional_tickers))
-    print(f"Compiled {len(all_tickers)} unique tickers")
+        if hasattr(rf_monthly_decimal.index, 'tz'):
+            rf_monthly_decimal.index = rf_monthly_decimal.index.tz_localize(None)
 
-    return pd.DataFrame({'Ticker': all_tickers})
+        logger.info(f"Yahoo RF: {len(rf_monthly_decimal)} months")
+        return rf_monthly_decimal
+
+    except Exception as e:
+        logger.warning(f"Yahoo RF failed: {e}, using 2% annual fallback")
+        date_range = pd.date_range(start=START_DATE, end=END_DATE, freq='ME')
+        monthly_rate = (1 + 0.02) ** (1/12) - 1
+        return pd.Series(monthly_rate, index=date_range, name='RF_Rate')
 
 
-def clean_tickers(holdings_df: pd.DataFrame) -> list:
-    """
-    Clean ticker symbols from holdings DataFrame.
+def download_monthly_prices(tickers, start_date, end_date):
+    """Download monthly adjusted close prices for all tickers."""
+    logger.info(f"Downloading monthly prices for {len(tickers)} tickers...")
 
-    Args:
-        holdings_df: DataFrame containing 'Ticker' column
+    all_data = pd.DataFrame()
+    failed_tickers = []
 
-    Returns:
-        List of cleaned, valid ticker symbols
-    """
-    print("Cleaning ticker symbols...")
-
-    # Get ticker column (try different possible column names)
-    ticker_col = None
-    for col in ['Ticker', 'ticker', 'Symbol', 'symbol', 'TICKER', 'SYMBOL']:
-        if col in holdings_df.columns:
-            ticker_col = col
-            break
-
-    if ticker_col is None:
-        raise ValueError("Could not find ticker column in holdings data")
-
-    tickers = holdings_df[ticker_col].dropna().astype(str).tolist()
-
-    # Clean tickers
-    cleaned = []
-    for ticker in tickers:
-        # Skip empty or invalid
-        if not ticker or ticker in ['nan', '-', 'N/A', 'NA', 'CASH', 'Cash']:
-            continue
-
-        # Remove whitespace
-        ticker = ticker.strip().upper()
-
-        # Skip ETFs, preferred stocks, warrants, etc.
-        # Keep only standard stock tickers (1-5 letters, or with common suffixes)
-        if not re.match(r'^[A-Z]{1,5}$', ticker):
-            # Allow tickers with dots like BRK.B or BF.B
-            if re.match(r'^[A-Z]{1,4}\.[A-Z]$', ticker):
-                # Convert to Yahoo format (BRK.B -> BRK-B)
-                ticker = ticker.replace('.', '-')
-            else:
-                continue
-
-        cleaned.append(ticker)
-
-    # Remove duplicates while preserving order
-    seen = set()
-    unique_tickers = []
-    for t in cleaned:
-        if t not in seen:
-            seen.add(t)
-            unique_tickers.append(t)
-
-    print(f"Cleaned tickers: {len(unique_tickers)} valid symbols")
-    return unique_tickers
-
-
-def download_price_data(tickers: list, start: str, end: str) -> pd.DataFrame:
-    """
-    Download monthly adjusted close prices for given tickers.
-
-    Args:
-        tickers: List of ticker symbols
-        start: Start date string (YYYY-MM-DD)
-        end: End date string (YYYY-MM-DD)
-
-    Returns:
-        DataFrame with monthly prices (tickers as columns, dates as index)
-    """
-    print(f"Downloading price data for {len(tickers)} tickers...")
-    print(f"Date range: {start} to {end}")
-
-    # Download in batches to avoid timeout issues
-    batch_size = 100
-    all_data = []
-
-    for i in range(0, len(tickers), batch_size):
-        batch = tickers[i:i+batch_size]
-        print(f"  Downloading batch {i//batch_size + 1}/{(len(tickers)-1)//batch_size + 1} ({len(batch)} tickers)...")
+    for i in range(0, len(tickers), DOWNLOAD_BATCH_SIZE):
+        batch = tickers[i:i+DOWNLOAD_BATCH_SIZE]
+        batch_num = i // DOWNLOAD_BATCH_SIZE + 1
+        total_batches = (len(tickers) - 1) // DOWNLOAD_BATCH_SIZE + 1
+        logger.info(f"Batch {batch_num}/{total_batches} ({len(batch)} tickers)")
 
         try:
-            # Download daily data first, then resample to monthly
             data = yf.download(
-                batch,
-                start=start,
-                end=end,
-                interval='1d',
-                auto_adjust=True,
-                progress=False,
-                threads=True
+                batch, start=start_date, end=end_date,
+                interval='1mo', auto_adjust=True, progress=False, threads=True
             )
 
-            if not data.empty:
-                # Get adjusted close prices
-                if 'Close' in data.columns or (isinstance(data.columns, pd.MultiIndex) and 'Close' in data.columns.get_level_values(0)):
-                    if isinstance(data.columns, pd.MultiIndex):
-                        prices = data['Close']
-                    else:
-                        # Single ticker case
-                        prices = data[['Close']]
-                        if len(batch) == 1:
-                            prices.columns = batch
+            if data.empty:
+                failed_tickers.extend(batch)
+                continue
 
-                    all_data.append(prices)
+            if len(batch) == 1:
+                batch_df = data[['Close']].copy() if 'Close' in data.columns else pd.DataFrame()
+                batch_df.columns = [batch[0]]
+            else:
+                if isinstance(data.columns, pd.MultiIndex):
+                    batch_df = data['Close'].copy() if 'Close' in data.columns.get_level_values(0) else pd.DataFrame()
+                else:
+                    batch_df = data[['Close']].copy() if 'Close' in data.columns else pd.DataFrame()
 
-        except Exception as e:
-            print(f"  Warning: Error downloading batch: {e}")
-            continue
-
-    if not all_data:
-        raise ValueError("Failed to download any price data")
-
-    # Combine all batches
-    prices = pd.concat(all_data, axis=1)
-
-    # Remove duplicate columns if any
-    prices = prices.loc[:, ~prices.columns.duplicated()]
-
-    # Resample to month-end
-    monthly_prices = prices.resample('ME').last()
-
-    print(f"Downloaded monthly prices: {monthly_prices.shape[0]} months, {monthly_prices.shape[1]} tickers")
-
-    return monthly_prices
-
-
-def download_benchmark_data(start: str, end: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Download IWV (Russell 3000 ETF) and risk-free rate (^IRX) data.
-
-    Args:
-        start: Start date string
-        end: End date string
-
-    Returns:
-        Tuple of (IWV monthly prices, monthly risk-free rate)
-    """
-    print("Downloading benchmark (IWV) and risk-free rate (^IRX) data...")
-
-    # Download IWV
-    iwv_data = yf.download('IWV', start=start, end=end, interval='1d',
-                           auto_adjust=True, progress=False)
-    if iwv_data.empty:
-        raise ValueError("Failed to download IWV data")
-
-    iwv_monthly = iwv_data['Close'].resample('ME').last()
-    iwv_monthly = pd.DataFrame(iwv_monthly)
-    iwv_monthly.columns = ['IWV']
-
-    # Download ^IRX (3-month T-Bill rate)
-    irx_data = yf.download('^IRX', start=start, end=end, interval='1d',
-                           auto_adjust=True, progress=False)
-
-    if irx_data.empty:
-        print("Warning: Could not download ^IRX, using alternative risk-free rate source...")
-        # Fallback to ^TNX (10-year) or assume zero
-        try:
-            irx_data = yf.download('^TNX', start=start, end=end, interval='1d',
-                                   auto_adjust=True, progress=False)
-        except:
-            pass
-
-    if not irx_data.empty:
-        # Resample to month-end
-        rf_monthly = irx_data['Close'].resample('ME').last()
-        # Convert from annual percentage to monthly decimal
-        # IRX is quoted as annualized percentage (e.g., 5.0 means 5%)
-        rf_monthly = (rf_monthly / 100) / 12  # Annual % -> monthly decimal
-    else:
-        print("Warning: Using zero risk-free rate as fallback")
-        rf_monthly = pd.Series(0, index=iwv_monthly.index)
-
-    rf_monthly = pd.DataFrame(rf_monthly)
-    rf_monthly.columns = ['RF']
-
-    print(f"IWV data: {len(iwv_monthly)} months")
-    print(f"Risk-free rate data: {len(rf_monthly)} months")
-
-    return iwv_monthly, rf_monthly
-
-
-def download_fama_french_factors() -> pd.DataFrame:
-    """
-    Download Fama-French factor data from Ken French's data library.
-
-    Downloads:
-    - FF 5 Factors (Mkt-RF, SMB, HML, RMW, CMA)
-    - Momentum factor (MOM)
-
-    Returns:
-        DataFrame with monthly factor returns
-    """
-    print("Downloading Fama-French factor data...")
-
-    try:
-        import zipfile
-        from io import BytesIO
-
-        # Download 5-factor data
-        response = requests.get(FF_FACTORS_URL, timeout=30)
-        with zipfile.ZipFile(BytesIO(response.content)) as z:
-            # Find the CSV file
-            csv_name = [n for n in z.namelist() if n.endswith('.CSV') or n.endswith('.csv')][0]
-            with z.open(csv_name) as f:
-                content = f.read().decode('utf-8')
-
-        # Parse the CSV - find where monthly data starts and ends
-        lines = content.split('\n')
-        start_idx = None
-        end_idx = None
-
-        for i, line in enumerate(lines):
-            if line.strip().startswith('199') or line.strip().startswith('200') or line.strip().startswith('201') or line.strip().startswith('202'):
-                if start_idx is None:
-                    start_idx = i
-                end_idx = i
-            elif start_idx is not None and 'Annual' in line:
-                break
-
-        # Read just the monthly data
-        if start_idx:
-            # Get header (usually one line before data)
-            header_line = lines[start_idx - 1] if start_idx > 0 else "Date,Mkt-RF,SMB,HML,RMW,CMA,RF"
-            monthly_lines = [header_line] + lines[start_idx:end_idx+1]
-            ff_data = pd.read_csv(StringIO('\n'.join(monthly_lines)))
-
-            # Rename first column to Date if needed
-            ff_data.columns = ['Date'] + list(ff_data.columns[1:])
-
-            # Parse date
-            ff_data['Date'] = pd.to_datetime(ff_data['Date'].astype(str), format='%Y%m')
-            ff_data['Date'] = ff_data['Date'] + pd.offsets.MonthEnd(0)
-            ff_data = ff_data.set_index('Date')
-
-            # Convert from percentage to decimal
-            for col in ff_data.columns:
-                ff_data[col] = ff_data[col].astype(float) / 100
-        else:
-            raise ValueError("Could not parse FF data")
-
-        # Try to download momentum factor
-        try:
-            response = requests.get(FF_MOMENTUM_URL, timeout=30)
-            with zipfile.ZipFile(BytesIO(response.content)) as z:
-                csv_name = [n for n in z.namelist() if n.endswith('.CSV') or n.endswith('.csv')][0]
-                with z.open(csv_name) as f:
-                    content = f.read().decode('utf-8')
-
-            lines = content.split('\n')
-            start_idx = None
-            end_idx = None
-
-            for i, line in enumerate(lines):
-                if line.strip().startswith('199') or line.strip().startswith('200') or line.strip().startswith('201') or line.strip().startswith('202'):
-                    if start_idx is None:
-                        start_idx = i
-                    end_idx = i
-                elif start_idx is not None and 'Annual' in line:
-                    break
-
-            if start_idx:
-                header_line = "Date,Mom"
-                monthly_lines = [header_line] + lines[start_idx:end_idx+1]
-                mom_data = pd.read_csv(StringIO('\n'.join(monthly_lines)))
-                mom_data.columns = ['Date', 'Mom']
-                mom_data['Date'] = pd.to_datetime(mom_data['Date'].astype(str).str.strip(), format='%Y%m')
-                mom_data['Date'] = mom_data['Date'] + pd.offsets.MonthEnd(0)
-                mom_data = mom_data.set_index('Date')
-                mom_data['Mom'] = mom_data['Mom'].astype(float) / 100
-
-                # Merge with FF data
-                ff_data = ff_data.join(mom_data, how='left')
+            if not batch_df.empty:
+                all_data = batch_df if all_data.empty else all_data.join(batch_df, how='outer')
 
         except Exception as e:
-            print(f"  Warning: Could not download momentum factor: {e}")
-            ff_data['Mom'] = np.nan
+            logger.warning(f"Batch {batch_num} failed: {e}")
+            failed_tickers.extend(batch)
 
-        print(f"Downloaded FF factors: {len(ff_data)} months")
-        print(f"  Factors: {list(ff_data.columns)}")
+    if all_data.empty:
+        raise RuntimeError("No price data downloaded!")
 
-        return ff_data
+    all_data.index = pd.to_datetime(all_data.index)
+    all_data = all_data.resample('ME').last()
 
-    except Exception as e:
-        print(f"Error downloading FF factors: {e}")
-        print("Creating placeholder FF factor data...")
+    # Data quality filtering
+    logger.info("Applying data quality filters...")
+    initial_count = len(all_data.columns)
 
-        # Create placeholder data
-        dates = pd.date_range(start=START_DATE, end=END_DATE, freq='ME')
-        ff_data = pd.DataFrame(index=dates)
-        ff_data.index.name = 'Date'
-        for col in ['Mkt-RF', 'SMB', 'HML', 'RMW', 'CMA', 'RF', 'Mom']:
-            ff_data[col] = np.nan
+    # 1. Coverage filter
+    coverage = all_data.notna().sum() / len(all_data)
+    all_data = all_data[coverage[coverage >= MIN_DATA_COVERAGE].index]
+    logger.info(f"Coverage filter: {len(all_data.columns)}/{initial_count} tickers")
 
-        return ff_data
+    # 2. Full history filter
+    if REQUIRE_FULL_HISTORY:
+        first_valid = all_data.apply(lambda x: x.first_valid_index())
+        start_threshold = pd.Timestamp(START_DATE) + pd.DateOffset(months=3)
+        all_data = all_data[first_valid[first_valid <= start_threshold].index]
+        logger.info(f"History filter: {len(all_data.columns)} tickers")
+
+    # 3. Gap filter
+    def has_large_gaps(series, max_gap=MAX_GAP_MONTHS):
+        is_na = series.isna()
+        if not is_na.any():
+            return False
+        gaps = is_na.astype(int).groupby((~is_na).cumsum()).sum()
+        return gaps.max() > max_gap
+
+    no_gaps = [col for col in all_data.columns if not has_large_gaps(all_data[col])]
+    all_data = all_data[no_gaps]
+    logger.info(f"Gap filter: {len(all_data.columns)} tickers")
+
+    all_data = all_data.ffill(limit=2)
+
+    logger.info(f"Final: {all_data.shape[1]} stocks, {all_data.shape[0]} months")
+    if failed_tickers:
+        logger.info(f"Failed: {len(failed_tickers)} tickers")
+
+    return all_data
 
 
-def compute_returns(prices: pd.DataFrame) -> pd.DataFrame:
-    """
-    Compute simple monthly returns from price data.
+def download_benchmark(start_date, end_date):
+    """Download market benchmark monthly prices."""
+    logger.info(f"Downloading benchmark ({BENCHMARK_TICKER})...")
 
-    Args:
-        prices: DataFrame of monthly prices
+    data = yf.download(
+        BENCHMARK_TICKER, start=start_date, end=end_date,
+        interval='1mo', auto_adjust=True, progress=False
+    )
 
-    Returns:
-        DataFrame of monthly returns
-    """
+    if data.empty:
+        raise ValueError(f"No data for {BENCHMARK_TICKER}")
+
+    benchmark = data['Close'].iloc[:, 0] if isinstance(data.columns, pd.MultiIndex) else data['Close']
+    benchmark.index = pd.to_datetime(benchmark.index)
+    benchmark = benchmark.resample('ME').last()
+    benchmark.name = 'Benchmark'
+
+    logger.info(f"Benchmark: {len(benchmark)} months")
+    return benchmark
+
+
+def compute_returns(prices):
+    """Compute simple monthly returns."""
     returns = prices.pct_change()
-    # First row will be NaN
-    return returns
+    return returns.iloc[1:]
 
 
-def compute_excess_returns(returns: pd.DataFrame, rf_rate: pd.DataFrame) -> pd.DataFrame:
+def winsorize(series, percentile=WINSORIZE_PERCENTILE):
+    """Winsorize series at given percentile."""
+    lower = series.quantile(percentile)
+    upper = series.quantile(1 - percentile)
+    return series.clip(lower=lower, upper=upper)
+
+
+def compute_fp_betas(stock_returns, market_returns):
     """
-    Compute excess returns (return - risk-free rate).
+    Compute Frazzini-Pedersen betas with shrinkage.
 
-    This follows the standard asset pricing convention where:
-    Excess Return = Raw Return - Risk-Free Rate
-
-    Args:
-        returns: DataFrame of monthly returns
-        rf_rate: DataFrame with 'RF' column of monthly risk-free rates
-
-    Returns:
-        DataFrame of excess returns
+    Beta_FP = correlation(12m) * (vol_stock(60m) / vol_market(60m))
+    Beta_shrunk = 0.6 * Beta_FP + 0.4 * 1.0
     """
-    # Align indices
-    common_idx = returns.index.intersection(rf_rate.index)
+    logger.info("Computing F&P betas (correlation 12m, volatility 60m)...")
 
-    excess = returns.loc[common_idx].subtract(rf_rate.loc[common_idx, 'RF'], axis=0)
+    common_dates = stock_returns.index.intersection(market_returns.index)
+    stocks = stock_returns.loc[common_dates]
+    market = market_returns.loc[common_dates]
 
-    return excess
+    betas = pd.DataFrame(index=stocks.index, columns=stocks.columns, dtype=float)
 
+    # Pre-compute market volatility
+    market_vol = market.rolling(window=VOLATILITY_WINDOW, min_periods=MIN_PERIODS_VOL).std()
 
-def compute_rolling_betas(excess_returns: pd.DataFrame,
-                          iwv_excess_returns: pd.Series,
-                          window: int = 60,
-                          min_periods: int = 36) -> pd.DataFrame:
-    """
-    Compute rolling betas using 60-month rolling window.
+    for col in stocks.columns:
+        stock = stocks[col]
 
-    Following Frazzini and Pedersen (2014):
-    Beta = Cov(R_i - R_f, R_m - R_f) / Var(R_m - R_f)
+        # Correlation over 12 months
+        rolling_corr = stock.rolling(window=CORRELATION_WINDOW, min_periods=MIN_PERIODS_CORR).corr(market)
 
-    Key methodological decisions:
-    - Rolling window: 60 months (5 years) as in original paper
-    - Minimum periods: 36 months required for valid estimate
-    - No shrinkage applied (unlike some implementations)
-    - Betas computed at month-end for use in next month's portfolio formation
+        # Volatility over 60 months
+        stock_vol = stock.rolling(window=VOLATILITY_WINDOW, min_periods=MIN_PERIODS_VOL).std()
 
-    Args:
-        excess_returns: DataFrame of stock excess returns
-        iwv_excess_returns: Series of IWV (market) excess returns
-        window: Rolling window size in months (default 60)
-        min_periods: Minimum observations required for valid beta (default 36)
+        # Time-series beta
+        beta_ts = rolling_corr * (stock_vol / market_vol)
 
-    Returns:
-        DataFrame of rolling betas (same shape as excess_returns)
-    """
-    print(f"Computing rolling {window}-month betas (min {min_periods} months required)...")
+        # Shrinkage toward prior
+        beta_shrunk = SHRINKAGE_FACTOR * beta_ts + (1 - SHRINKAGE_FACTOR) * PRIOR_BETA
 
-    # Align data
-    common_idx = excess_returns.index.intersection(iwv_excess_returns.index)
-    stock_returns = excess_returns.loc[common_idx]
-    market_returns = iwv_excess_returns.loc[common_idx]
+        betas[col] = beta_shrunk
 
-    # Initialize beta DataFrame
-    betas = pd.DataFrame(index=stock_returns.index, columns=stock_returns.columns, dtype=float)
-
-    # Compute rolling market variance
-    market_var = market_returns.rolling(window=window, min_periods=min_periods).var()
-
-    # Compute rolling covariance and beta for each stock
-    for col in stock_returns.columns:
-        stock_ret = stock_returns[col]
-        # Rolling covariance
-        cov = stock_ret.rolling(window=window, min_periods=min_periods).cov(market_returns)
-        # Beta = Cov / Var
-        betas[col] = cov / market_var
-
-    # Replace infinities with NaN
     betas = betas.replace([np.inf, -np.inf], np.nan)
 
-    # Winsorize extreme betas (optional, but common in practice)
-    # Following academic practice, cap at reasonable bounds
-    betas = betas.clip(lower=-2.0, upper=5.0)
+    # Winsorize betas
+    for date in betas.index:
+        row = betas.loc[date].dropna()
+        if len(row) > 10:
+            betas.loc[date, row.index] = winsorize(row)
 
-    # Count valid betas
-    valid_count = betas.notna().sum().sum()
-    print(f"Computed {valid_count:,} valid beta values")
-
-    # Report statistics
-    mean_beta = betas.mean().mean()
-    print(f"  Average beta across all stocks/months: {mean_beta:.3f}")
+    valid_betas = betas.notna().sum().sum()
+    total_cells = betas.shape[0] * betas.shape[1]
+    logger.info(f"F&P Betas: {valid_betas:,}/{total_cells:,} valid ({100*valid_betas/total_cells:.1f}%)")
 
     return betas
 
 
+def save_data(data, filename):
+    """Save DataFrame to CSV."""
+    ensure_directories()
+    filepath = os.path.join(DATA_DIR, filename)
+    if isinstance(data, pd.Series):
+        data = data.to_frame()
+    data.to_csv(filepath)
+    logger.info(f"Saved {filename}: {data.shape}")
+
+
 def main():
-    """Main function to execute the data loading pipeline."""
-    print("=" * 70)
-    print("BAB Strategy Data Loader")
-    print("Replication of Frazzini and Pedersen (2014)")
-    print("=" * 70)
-    print(f"Start Date: {START_DATE}")
-    print(f"End Date: {END_DATE}")
-    print(f"Rolling Beta Window: {ROLLING_WINDOW} months")
-    print(f"Minimum Periods for Beta: {MIN_PERIODS} months")
-    print("=" * 70)
-    print("\n*** SURVIVORSHIP BIAS WARNING ***")
-    print("Using today's Russell 3000 constituents applied historically.")
-    print("Results should be interpreted as indicative, not definitive.")
-    print("=" * 70)
+    """Main data loading pipeline."""
+    logger.info("=" * 60)
+    logger.info("BAB Data Loader - Russell 3000")
+    logger.info(f"Date range: {START_DATE} to {END_DATE}")
+    logger.info("=" * 60)
 
-    # Create data directory
-    ensure_data_dir()
+    ensure_directories()
 
-    # Write survivorship bias warning
-    write_survivorship_bias_warning()
+    # Get unique tickers
+    tickers = list(dict.fromkeys(RUSSELL_3000_TICKERS))
+    logger.info(f"Total tickers: {len(tickers)}")
 
-    # Step 1: Download IWV holdings to get Russell 3000 tickers
-    holdings = download_iwv_holdings()
-    tickers = clean_tickers(holdings)
+    # Download data
+    stock_prices = download_monthly_prices(tickers, START_DATE, END_DATE)
+    benchmark_prices = download_benchmark(START_DATE, END_DATE)
+    rf_rate = download_ken_french_rf()
 
-    # Save tickers list
-    pd.DataFrame({'Ticker': tickers}).to_csv(TICKERS_FILE, index=False)
-    print(f"Saved {len(tickers)} tickers to {TICKERS_FILE}")
+    # Compute returns
+    stock_returns = compute_returns(stock_prices)
+    benchmark_returns = compute_returns(benchmark_prices.to_frame()).iloc[:, 0]
 
-    # Step 2: Download price data for all tickers
-    prices = download_price_data(tickers, START_DATE, END_DATE)
+    # Align dates
+    common_dates = stock_returns.index.intersection(benchmark_returns.index).intersection(rf_rate.index)
+    stock_returns = stock_returns.loc[common_dates]
+    benchmark_returns = benchmark_returns.loc[common_dates]
+    rf_rate = rf_rate.loc[common_dates]
 
-    # Step 3: Download benchmark and risk-free rate data
-    iwv_prices, rf_rate = download_benchmark_data(START_DATE, END_DATE)
+    # Compute excess returns
+    stock_excess = stock_returns.subtract(rf_rate, axis=0)
+    benchmark_excess = benchmark_returns - rf_rate
 
-    # Step 4: Download Fama-French factors
-    ff_factors = download_fama_french_factors()
+    # Compute F&P betas
+    rolling_betas = compute_fp_betas(stock_excess, benchmark_excess)
 
-    # Step 5: Compute returns
-    returns = compute_returns(prices)
-    iwv_returns = compute_returns(iwv_prices)
+    # Save outputs
+    save_data(stock_prices, 'monthly_prices.csv')
+    save_data(stock_returns, 'monthly_returns.csv')
+    stock_excess['Benchmark'] = benchmark_excess
+    save_data(stock_excess, 'monthly_excess_returns.csv')
+    save_data(rf_rate, 'risk_free_rate.csv')
+    save_data(rolling_betas, 'rolling_betas.csv')
 
-    # Step 6: Compute excess returns
-    excess_returns = compute_excess_returns(returns, rf_rate)
-    iwv_excess = compute_excess_returns(iwv_returns, rf_rate)
-
-    # Step 7: Compute rolling betas
-    betas = compute_rolling_betas(
-        excess_returns,
-        iwv_excess['IWV'],
-        window=ROLLING_WINDOW,
-        min_periods=MIN_PERIODS
+    # Save ticker list
+    pd.DataFrame({'Ticker': list(stock_prices.columns)}).to_csv(
+        os.path.join(DATA_DIR, 'ticker_list.csv'), index=False
     )
 
-    # Step 8: Save all outputs
-    print("\nSaving data files...")
+    logger.info("=" * 60)
+    logger.info("Data loading complete!")
+    logger.info("=" * 60)
 
-    prices.to_csv(PRICES_FILE)
-    print(f"  Saved: {PRICES_FILE}")
-
-    returns.to_csv(RETURNS_FILE)
-    print(f"  Saved: {RETURNS_FILE}")
-
-    excess_returns.to_csv(EXCESS_RETURNS_FILE)
-    print(f"  Saved: {EXCESS_RETURNS_FILE}")
-
-    betas.to_csv(BETAS_FILE)
-    print(f"  Saved: {BETAS_FILE}")
-
-    rf_rate.to_csv(RF_RATE_FILE)
-    print(f"  Saved: {RF_RATE_FILE}")
-
-    iwv_returns.to_csv(IWV_RETURNS_FILE)
-    print(f"  Saved: {IWV_RETURNS_FILE}")
-
-    iwv_excess.to_csv(IWV_EXCESS_RETURNS_FILE)
-    print(f"  Saved: {IWV_EXCESS_RETURNS_FILE}")
-
-    ff_factors.to_csv(FF_FACTORS_FILE)
-    print(f"  Saved: {FF_FACTORS_FILE}")
-
-    print("\n" + "=" * 70)
-    print("Data loading complete!")
-    print("=" * 70)
-
-    # Summary statistics
-    print("\nSummary:")
-    print(f"  Total tickers: {len(tickers)}")
-    print(f"  Date range: {prices.index.min()} to {prices.index.max()}")
-    print(f"  Monthly observations: {len(prices)}")
-    print(f"  Tickers with valid betas: {(betas.notna().sum() > 0).sum()}")
-    print(f"  Fama-French factors available: {list(ff_factors.columns)}")
+    print(f"\n=== Data Summary ===")
+    print(f"Stocks: {len(stock_prices.columns)}")
+    print(f"Months: {len(stock_prices)}")
+    print(f"Date range: {stock_prices.index.min()} to {stock_prices.index.max()}")
+    print(f"Avg valid betas (last 12m): {rolling_betas.tail(12).notna().sum(axis=1).mean():.0f}")
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
