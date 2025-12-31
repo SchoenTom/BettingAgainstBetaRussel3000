@@ -4,7 +4,7 @@ portfolio_construction.py - Construct BAB portfolios following F&P (2014) Table 
 Key methodology from Frazzini & Pedersen (2014):
 1. Decile portfolios: Equal-weighted within each decile
 2. BAB factor: Beta-rank weighted, rescaled to beta=1 per leg
-3. Dollar-neutral: Normalize to $2 gross exposure ($1 per leg)
+3. Beta-neutral: Rescale each leg to beta=1, normalize to $2 gross exposure
 4. Uses LAGGED betas (t-1) to avoid look-ahead bias
 """
 
@@ -154,7 +154,7 @@ def construct_bab_portfolios(excess_returns, betas):
             continue
 
         # =================================================================
-        # DOLLAR-NEUTRAL BAB CONSTRUCTION
+        # BETA-NEUTRAL BAB CONSTRUCTION (F&P 2014)
         # =================================================================
         # Raw weights to rescale each leg to beta=1
         w_L_raw = 1.0 / beta_L
